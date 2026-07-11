@@ -352,10 +352,7 @@ def inject_print_styles(driver):
             }
 
             @media print {
-                @page {
-                    size: 7.25in 10.5in;
-                    margin: 0;
-                }
+                
 
                 html,
                 body {
@@ -384,18 +381,18 @@ def inject_print_styles(driver):
                     padding: 0 !important;
                 }
 
-                .outer_page {
-                    margin: 0 !important;
-                    break-inside: avoid !important;
-                    page-break-inside: avoid !important;
-                    break-after: page !important;
-                    page-break-after: always !important;
-                }
+                # .outer_page {
+                #     margin: 0 !important;
+                #     break-inside: avoid !important;
+                #     page-break-inside: avoid !important;
+                #     break-after: page !important;
+                #     page-break-after: always !important;
+                # }
 
-                .outer_page:last-of-type {
-                    break-after: auto !important;
-                    page-break-after: auto !important;
-                }
+                # .outer_page:last-of-type {
+                #     break-after: auto !important;
+                #     page-break-after: auto !important;
+                # }
 
                 mjx-container,
                 .MathJax,
@@ -585,71 +582,310 @@ def read_pdf_stream_to_file(driver, stream_handle, filename):
         driver.execute_cdp_cmd("IO.close", {"handle": stream_handle})
 
 
-def save_pdf_directly(
+def save_pdf_pages_individually(
     driver,
     filename,
     timeout_seconds=DEFAULT_CDP_TIMEOUT_SECONDS,
-    paper_size=None,
 ):
-    """
-    Generate and save a PDF using Chrome DevTools Protocol.
+    import fitz
 
-    A longer ChromeDriver timeout plus transferMode=ReturnAsStream makes large,
-    image-heavy documents far less likely to fail with a 120 second read timeout.
-    """
-    configure_command_timeout(driver, timeout_seconds)
+    configure_command_timeout(
+        driver,
+        timeout_seconds,
+    )
 
-    if paper_size is None:
-        paper_size = {
-            "widthInches": DEFAULT_PAPER_WIDTH_INCHES,
-            "heightInches": DEFAULT_PAPER_HEIGHT_INCHES,
-        }
+    page_count = driver.execute_script(
+        """
+        return document.querySelectorAll(
+            '.outer_page'
+        ).length;
+        """
+    )
 
-    pdf_options = {
-        "landscape": False,
-        "displayHeaderFooter": False,
-        "printBackground": True,
-        "scale": 1,
-        "paperWidth": paper_size["widthInches"],
-        "paperHeight": paper_size["heightInches"],
-        "marginTop": 0,
-        "marginBottom": 0,
-        "marginLeft": 0,
-        "marginRight": 0,
-        "preferCSSPageSize": False,
-    }
+    if page_count <= 0:
+        raise RuntimeError(
+            "No .outer_page elements found."
+        )
+
+    print(
+        f"Exporting {page_count} "
+        "document pages individually..."
+    )
+
+    final_pdf = fitz.open()
 
     try:
-        try:
-            result = driver.execute_cdp_cmd(
-                "Page.printToPDF",
+        for index in range(page_count):
+            page_info = driver.execute_script(
+                """
+                const targetIndex = arguments[0];
+
+                const pages = Array.from(
+                    document.querySelectorAll(
+                        '.outer_page'
+                    )
+                );
+
+                const target = pages[targetIndex];
+
+                if (!target) {
+                    return null;
+                }
+
+                /*
+                 * Remove previous isolated-print style.
+                 */
+                const oldStyle = document.getElementById(
+                    'isolated-page-print-style'
+                );
+
+                if (oldStyle) {
+                    oldStyle.remove();
+                }
+
+                /*
+                 * Restore all pages before measuring.
+                 */
+                pages.forEach((page) => {
+                    page.style.removeProperty('display');
+                    page.style.removeProperty('visibility');
+                    page.style.removeProperty('position');
+                    page.style.removeProperty('top');
+                    page.style.removeProperty('left');
+                    page.style.removeProperty('right');
+                    page.style.removeProperty('bottom');
+                    page.style.removeProperty('margin');
+                    page.style.removeProperty('break-after');
+                    page.style.removeProperty('page-break-after');
+                    page.style.removeProperty('break-before');
+                    page.style.removeProperty('page-break-before');
+                });
+
+                const rect = target.getBoundingClientRect();
+
+                const width = Math.ceil(rect.width);
+                const height = Math.ceil(rect.height);
+
+                /*
+                 * Mark the target instead of relying on nth-child.
+                 */
+                pages.forEach((page) => {
+                    page.removeAttribute(
+                        'data-export-target'
+                    );
+                });
+
+                target.setAttribute(
+                    'data-export-target',
+                    'true'
+                );
+
+                const style = document.createElement(
+                    'style'
+                );
+
+                style.id = 'isolated-page-print-style';
+
+                style.textContent = `
+                    @page {
+                        size: ${width}px ${height}px;
+                        margin: 0;
+                    }
+
+                    @media print {
+                        html,
+                        body {
+                            width: ${width}px !important;
+                            height: ${height}px !important;
+                            min-width: ${width}px !important;
+                            min-height: ${height}px !important;
+                            max-width: ${width}px !important;
+                            max-height: ${height}px !important;
+
+                            margin: 0 !important;
+                            padding: 0 !important;
+
+                            overflow: hidden !important;
+
+                            -webkit-print-color-adjust:
+                                exact !important;
+
+                            print-color-adjust:
+                                exact !important;
+                        }
+
+                        .outer_page {
+                            display: none !important;
+                        }
+
+                        .outer_page[
+                            data-export-target="true"
+                        ] {
+                            display: block !important;
+                            visibility: visible !important;
+
+                            position: absolute !important;
+
+                            top: 0 !important;
+                            left: 0 !important;
+                            right: auto !important;
+                            bottom: auto !important;
+
+                            width: ${width}px !important;
+                            height: ${height}px !important;
+
+                            min-width: 0 !important;
+                            min-height: 0 !important;
+
+                            max-width: none !important;
+                            max-height: none !important;
+
+                            margin: 0 !important;
+                            padding: 0 !important;
+
+                            transform: none !important;
+
+                            break-before: auto !important;
+                            break-after: auto !important;
+                            break-inside: auto !important;
+
+                            page-break-before:
+                                auto !important;
+
+                            page-break-after:
+                                auto !important;
+
+                            page-break-inside:
+                                auto !important;
+
+                            overflow: hidden !important;
+                        }
+                    }
+                `;
+
+                document.head.appendChild(style);
+
+                return {
+                    width,
+                    height
+                };
+                """,
+                index,
+            )
+
+            if not page_info:
+                print(
+                    f"  Skipping page "
+                    f"{index + 1}: element missing"
+                )
+                continue
+
+            width_px = int(page_info["width"])
+            height_px = int(page_info["height"])
+
+            if width_px <= 0 or height_px <= 0:
+                print(
+                    f"  Skipping page {index + 1}: "
+                    f"invalid geometry "
+                    f"{width_px}x{height_px}"
+                )
+                continue
+
+            width_inches = width_px / 96.0
+            height_inches = height_px / 96.0
+
+            print(
+                f"  Page {index + 1}/{page_count} "
+                f"{width_px}x{height_px}px "
+                f"-> "
+                f'{width_inches:.3f}"'
+                f'x{height_inches:.3f}"'
+            )
+
+            driver.execute_cdp_cmd(
+                "Emulation.setEmulatedMedia",
                 {
-                    **pdf_options,
-                    "transferMode": "ReturnAsStream",
+                    "media": "print",
                 },
             )
 
-            if result.get("stream"):
-                read_pdf_stream_to_file(driver, result["stream"], filename)
-            else:
-                pdf_data = base64.b64decode(result["data"])
-                with open(filename, "wb") as file_handle:
-                    file_handle.write(pdf_data)
-        except Exception as stream_error:
-            print(f"Streamed PDF export unavailable, retrying without stream mode: {stream_error}")
-            result = driver.execute_cdp_cmd("Page.printToPDF", pdf_options)
-            pdf_data = base64.b64decode(result["data"])
-            with open(filename, "wb") as file_handle:
-                file_handle.write(pdf_data)
+            result = driver.execute_cdp_cmd(
+                "Page.printToPDF",
+                {
+                    "landscape": False,
+                    "displayHeaderFooter": False,
+                    "printBackground": True,
 
-        return os.path.abspath(filename)
-    except Exception as error:
-        print(f"Error saving PDF: {error}")
-        return None
+                    "scale": 1,
 
+                    "paperWidth": width_inches,
+                    "paperHeight": height_inches,
+
+                    "marginTop": 0,
+                    "marginBottom": 0,
+                    "marginLeft": 0,
+                    "marginRight": 0,
+
+           
+                    "preferCSSPageSize": True,
+
+                
+                    "pageRanges": "1",
+
+                    "transferMode": "ReturnAsBase64",
+                },
+            )
+
+            pdf_bytes = base64.b64decode(
+                result["data"]
+            )
+
+            page_pdf = fitz.open(
+                stream=pdf_bytes,
+                filetype="pdf",
+            )
+
+            try:
+                if page_pdf.page_count != 1:
+                    raise RuntimeError(
+                        f"Document page "
+                        f"{index + 1} produced "
+                        f"{page_pdf.page_count} "
+                        "PDF sheets; expected exactly 1."
+                    )
+
+                final_pdf.insert_pdf(
+                    page_pdf,
+                    from_page=0,
+                    to_page=0,
+                )
+
+            finally:
+                page_pdf.close()
+
+            print(
+                f"    OK: exactly 1 PDF sheet"
+            )
+
+        if final_pdf.page_count == 0:
+            raise RuntimeError(
+                "No valid document pages "
+                "were exported."
+            )
+
+        final_pdf.save(
+            filename,
+            garbage=4,
+            deflate=True,
+        )
+
+    finally:
+        final_pdf.close()
+
+    return os.path.abspath(filename)
 
 def main():
-    """Run the downloader interactively."""
+    """Run the exporter interactively."""
     input_url = input("Input link Scribd: ").strip()
 
     converted_url = convert_scribd_link(input_url)
@@ -660,17 +896,33 @@ def main():
 
     if converted_url == "Invalid Scribd URL":
         print("Error: Please provide a valid Scribd document URL")
-        print("Example: https://www.scribd.com/document/123456789/Document-Title")
-        print("Example: https://www.scribd.com/doc/123456789/Document-Title")
+        print(
+            "Example: "
+            "https://www.scribd.com/document/"
+            "123456789/Document-Title"
+        )
+        print(
+            "Example: "
+            "https://www.scribd.com/doc/"
+            "123456789/Document-Title"
+        )
         raise SystemExit(1)
 
-    with tempfile.TemporaryDirectory(prefix="scribd-chrome-profile-") as runtime_profile_dir:
+    with tempfile.TemporaryDirectory(
+        prefix="scribd-chrome-profile-"
+    ) as runtime_profile_dir:
         driver = None
 
         try:
             print("\nStarting Chrome browser...")
-            options = build_chrome_options(runtime_profile_dir)
-            driver = webdriver.Chrome(options=options)
+
+            options = build_chrome_options(
+                runtime_profile_dir
+            )
+
+            driver = webdriver.Chrome(
+                options=options
+            )
 
             driver.get(converted_url)
             time.sleep(1)
@@ -678,36 +930,77 @@ def main():
             hide_cookie_dialogs(driver)
             print("Cookie dialogs hidden.")
 
-            total_pages = scroll_through_pages(driver, DEFAULT_SCROLL_DELAY_SECONDS)
+            total_pages = scroll_through_pages(
+                driver,
+                DEFAULT_SCROLL_DELAY_SECONDS,
+            )
+
             if total_pages == 0:
-                raise RuntimeError("No printable Scribd pages were detected on the embed page.")
+                raise RuntimeError(
+                    "No printable document pages "
+                    "were detected."
+                )
 
             prepare_document_for_print(driver)
+
             inject_print_styles(driver)
-            wait_for_render_stability(driver, DEFAULT_RENDER_SETTLE_TIMEOUT_SECONDS)
-            driver.execute_cdp_cmd("Emulation.setEmulatedMedia", {"media": "print"})
-            paper_size = detect_document_paper_size(driver)
 
-            driver.execute_script("window.scrollTo(0, 0);")
-
-            print(f"\nSaving PDF as: {pdf_filename}")
-            print(
-                f'  Page size: {paper_size["widthInches"]:.2f}" x '
-                f'{paper_size["heightInches"]:.2f}" '
-                f'(from {paper_size["selector"]})'
+            wait_for_render_stability(
+                driver,
+                DEFAULT_RENDER_SETTLE_TIMEOUT_SECONDS,
             )
+
+            print(
+                f"\nSaving PDF as: {pdf_filename}"
+            )
+
+            print(
+                "  Export mode: "
+                "Individual document pages"
+            )
+
             print("  Margins: None")
-            print("  Headers/Footers: Disabled")
-            print(f"  ChromeDriver command timeout: {DEFAULT_CDP_TIMEOUT_SECONDS}s")
 
-            saved_path = save_pdf_directly(driver, pdf_filename, paper_size=paper_size)
+            print(
+                "  Headers/Footers: Disabled"
+            )
+
+            print(
+                "  ChromeDriver command timeout: "
+                f"{DEFAULT_CDP_TIMEOUT_SECONDS}s"
+            )
+
+            driver.execute_script(
+                "window.scrollTo(0, 0)"
+            )
+
+            saved_path = (
+                save_pdf_pages_individually(
+                    driver,
+                    pdf_filename,
+                )
+            )
+
             if not saved_path:
-                raise RuntimeError("PDF export failed.")
+                raise RuntimeError(
+                    "PDF export failed."
+                )
 
-            print(f"PDF saved successfully to: {saved_path}")
-        except (RuntimeError, WebDriverException) as error:
-            print(f"Download failed: {error}")
+            print(
+                "PDF saved successfully to: "
+                f"{saved_path}"
+            )
+
+        except (
+            RuntimeError,
+            WebDriverException,
+        ) as error:
+            print(
+                f"Export failed: {error}"
+            )
+
             raise SystemExit(1)
+
         finally:
             if driver is not None:
                 driver.quit()
@@ -716,3 +1009,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
