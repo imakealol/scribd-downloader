@@ -19,6 +19,7 @@ import os
 import re
 import tempfile
 import time
+from io import BytesIO
 from urllib.parse import unquote, urlparse
 
 from selenium import webdriver
@@ -31,6 +32,18 @@ DEFAULT_RENDER_SETTLE_TIMEOUT_SECONDS = int(
     os.getenv("SCRIBD_RENDER_SETTLE_TIMEOUT", "30")
 )
 DEFAULT_SCROLL_DELAY_SECONDS = float(os.getenv("SCRIBD_SCROLL_DELAY", "0.15"))
+DEFAULT_PAGE_LOAD_CONCURRENCY = max(
+    1,
+    int(os.getenv("SCRIBD_PAGE_LOAD_CONCURRENCY", "8")),
+)
+DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS = max(
+    10,
+    int(os.getenv("SCRIBD_PAGE_LOAD_TIMEOUT", "120")),
+)
+DEFAULT_EXPORT_BATCH_SIZE = max(
+    1,
+    int(os.getenv("SCRIBD_EXPORT_BATCH_SIZE", "8")),
+)
 PDF_STREAM_CHUNK_SIZE = int(os.getenv("SCRIBD_PDF_STREAM_CHUNK_SIZE", str(1024 * 1024)))
 HEADLESS_ENABLED = os.getenv("SCRIBD_HEADLESS", "1").strip().lower() not in {
     "0",
@@ -256,6 +269,171 @@ def scroll_through_pages(driver, scroll_delay_seconds):
     return scrolled_count
 
 
+def load_all_pages(driver):
+    """Load Scribd pages directly, without simulating user scrolling."""
+    page_count = driver.execute_script(
+        """
+        return window.docManager && window.docManager.pages
+            ? Object.values(window.docManager.pages).filter(Boolean).length
+            : 0;
+        """
+    )
+    batch_count = max(
+        1,
+        (page_count + DEFAULT_PAGE_LOAD_CONCURRENCY - 1)
+        // DEFAULT_PAGE_LOAD_CONCURRENCY,
+    )
+    document_timeout_seconds = (
+        DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS * batch_count
+    )
+    configure_command_timeout(driver, document_timeout_seconds + 10)
+    driver.set_script_timeout(document_timeout_seconds + 10)
+
+    result = driver.execute_async_script(
+        """
+        const concurrency = arguments[0];
+        const timeoutMs = arguments[1];
+        const documentTimeoutMs = arguments[2];
+        const done = arguments[arguments.length - 1];
+        const manager = window.docManager;
+
+        if (!manager || !manager.pages) {
+            done({supported: false});
+            return;
+        }
+
+        const pages = Object.values(manager.pages).filter(Boolean);
+        const pending = pages.filter((page) => !page.innerPageElem);
+        const active = new Map();
+        const failed = [];
+        const startedAt = Date.now();
+        let nextIndex = 0;
+        let completed = pages.length - pending.length;
+        let finished = false;
+
+        function finish() {
+            if (finished) {
+                return;
+            }
+
+            finished = true;
+            clearInterval(timer);
+
+            pages.forEach((page) => {
+                if (!page.innerPageElem) {
+                    return;
+                }
+
+                try {
+                    page.display();
+                } catch (error) {}
+
+                try {
+                    page.turnOnImages();
+                } catch (error) {}
+            });
+
+            done({
+                supported: true,
+                total: pages.length,
+                loaded: pages.filter((page) => page.innerPageElem).length,
+                failed,
+                elapsedMs: Date.now() - startedAt
+            });
+        }
+
+        function launchMore() {
+            while (active.size < concurrency && nextIndex < pending.length) {
+                const page = pending[nextIndex++];
+
+                try {
+                    if (!page.loadHasStarted) {
+                        page.load();
+                    }
+
+                    active.set(page.pageNum, {
+                        page,
+                        startedAt: Date.now()
+                    });
+                } catch (error) {
+                    failed.push({
+                        pageNum: page.pageNum,
+                        reason: String(error)
+                    });
+                }
+            }
+
+            if (completed + failed.length >= pages.length) {
+                finish();
+            }
+        }
+
+        const timer = setInterval(() => {
+            for (const [pageNum, state] of active) {
+                if (state.page.innerPageElem) {
+                    active.delete(pageNum);
+                    completed += 1;
+                    continue;
+                }
+
+                if (Date.now() - state.startedAt >= timeoutMs) {
+                    active.delete(pageNum);
+                    failed.push({
+                        pageNum,
+                        reason: 'page load timed out'
+                    });
+                }
+            }
+
+            if (Date.now() - startedAt >= documentTimeoutMs) {
+                for (const [pageNum] of active) {
+                    failed.push({
+                        pageNum,
+                        reason: 'document load timed out'
+                    });
+                }
+                active.clear();
+                finish();
+                return;
+            }
+
+            launchMore();
+        }, 50);
+
+        launchMore();
+        """,
+        DEFAULT_PAGE_LOAD_CONCURRENCY,
+        DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS * 1000,
+        document_timeout_seconds * 1000,
+    )
+
+    if not result.get("supported"):
+        print("Direct page loader unavailable; using scrolling fallback.")
+        return scroll_through_pages(driver, DEFAULT_SCROLL_DELAY_SECONDS)
+
+    total_pages = result["total"]
+    loaded_pages = result["loaded"]
+    elapsed_seconds = result["elapsedMs"] / 1000
+
+    print(
+        f"Loaded {loaded_pages}/{total_pages} pages directly "
+        f"in {elapsed_seconds:.2f}s "
+        f"(concurrency: {DEFAULT_PAGE_LOAD_CONCURRENCY})."
+    )
+
+    if result["failed"]:
+        failed_pages = ", ".join(
+            str(item["pageNum"])
+            for item in result["failed"]
+        )
+        raise RuntimeError(
+            "Failed to load Scribd page(s): "
+            f"{failed_pages}"
+        )
+
+    return loaded_pages
+
+
 def prepare_document_for_print(driver):
     """
     Remove UI chrome and make the scroll containers printable.
@@ -352,8 +530,6 @@ def inject_print_styles(driver):
             }
 
             @media print {
-                
-
                 html,
                 body {
                     margin: 0 !important;
@@ -380,19 +556,6 @@ def inject_print_styles(driver):
                     margin: 0 !important;
                     padding: 0 !important;
                 }
-
-                # .outer_page {
-                #     margin: 0 !important;
-                #     break-inside: avoid !important;
-                #     page-break-inside: avoid !important;
-                #     break-after: page !important;
-                #     page-break-after: always !important;
-                # }
-
-                # .outer_page:last-of-type {
-                #     break-after: auto !important;
-                #     page-break-after: auto !important;
-                # }
 
                 mjx-container,
                 .MathJax,
@@ -438,15 +601,10 @@ def wait_for_render_stability(driver, timeout_seconds):
                 const pendingImages = Array.from(document.images || []).filter(
                     (image) => !image.complete
                 ).length;
-                const busyNodes = document.querySelectorAll(
-                    "[aria-busy='true'], [class*='loading'], [class*='spinner']"
-                ).length;
-
                 return JSON.stringify({
                     pageCount: pages.length,
                     heights,
-                    pendingImages,
-                    busyNodes
+                    pendingImages
                 });
             }
 
@@ -460,7 +618,7 @@ def wait_for_render_stability(driver, timeout_seconds):
             function tick() {
                 lastSample = sample();
                 const parsed = JSON.parse(lastSample);
-                const isBusy = parsed.pendingImages > 0 || parsed.busyNodes > 0;
+                const isBusy = parsed.pendingImages > 0;
 
                 if (!isBusy && lastSample === window.__scribdLastRenderSample) {
                     stableTicks += 1;
@@ -582,12 +740,176 @@ def read_pdf_stream_to_file(driver, stream_handle, filename):
         driver.execute_cdp_cmd("IO.close", {"handle": stream_handle})
 
 
+def load_page_batch(driver, page_numbers):
+    """Load one bounded batch of page DOM and image assets."""
+    configure_command_timeout(
+        driver,
+        DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS + 10,
+    )
+    driver.set_script_timeout(DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS + 10)
+
+    result = driver.execute_async_script(
+        """
+        const pageNumbers = arguments[0];
+        const timeoutMs = arguments[1];
+        const done = arguments[arguments.length - 1];
+        const manager = window.docManager;
+
+        if (!manager || !manager.pages) {
+            done({supported: false});
+            return;
+        }
+
+        const states = pageNumbers.map((pageNum) => ({
+            pageNum,
+            page: manager.pages[pageNum],
+            error: null
+        }));
+        const startedAt = Date.now();
+
+        for (const state of states) {
+            if (!state.page) {
+                state.error = 'page object missing';
+                continue;
+            }
+
+            try {
+                if (!state.page.innerPageElem && !state.page.loadHasStarted) {
+                    state.page.load();
+                }
+            } catch (error) {
+                state.error = String(error);
+            }
+        }
+
+        const timer = setInterval(() => {
+            let ready = 0;
+
+            for (const state of states) {
+                if (state.error) {
+                    ready += 1;
+                    continue;
+                }
+
+                const page = state.page;
+                if (!page.innerPageElem) {
+                    continue;
+                }
+
+                try {
+                    page.display();
+                    if (!page._imagesTurnedOn) {
+                        page.turnOnImages();
+                    }
+                } catch (error) {
+                    state.error = String(error);
+                    ready += 1;
+                    continue;
+                }
+
+                const images = Array.from(
+                    page.innerPageElem.querySelectorAll('img')
+                );
+                const pending = images.filter((image) => !image.complete);
+
+                if (pending.length === 0) {
+                    ready += 1;
+                }
+            }
+
+            if (ready === states.length) {
+                clearInterval(timer);
+                done({
+                    supported: true,
+                    failed: states
+                        .filter((state) => state.error)
+                        .map((state) => ({
+                            pageNum: state.pageNum,
+                            reason: state.error
+                        }))
+                });
+                return;
+            }
+
+            if (Date.now() - startedAt >= timeoutMs) {
+                clearInterval(timer);
+                done({
+                    supported: true,
+                    failed: states
+                        .filter((state) => (
+                            state.error ||
+                            !state.page ||
+                            !state.page.innerPageElem ||
+                            Array.from(
+                                state.page.innerPageElem.querySelectorAll('img')
+                            ).some((image) => !image.complete)
+                        ))
+                        .map((state) => ({
+                            pageNum: state.pageNum,
+                            reason: state.error || 'page or image load timed out'
+                        }))
+                });
+            }
+        }, 50);
+        """,
+        list(page_numbers),
+        DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS * 1000,
+    )
+
+    if not result.get("supported"):
+        raise RuntimeError("Scribd direct page loader is unavailable.")
+
+    if result["failed"]:
+        details = ", ".join(
+            f"{item['pageNum']} ({item['reason']})"
+            for item in result["failed"]
+        )
+        raise RuntimeError(f"Failed to load Scribd page(s): {details}")
+
+
+def release_page_batch(driver, page_numbers):
+    """Release printed page DOM and image resources from Chrome."""
+    driver.execute_script(
+        """
+        const manager = window.docManager;
+        if (!manager || !manager.pages) {
+            return;
+        }
+
+        for (const pageNum of arguments[0]) {
+            const page = manager.pages[pageNum];
+            if (!page) {
+                continue;
+            }
+
+            try {
+                page.remove();
+            } catch (error) {
+                const container = document.getElementById(`outer_page_${pageNum}`);
+                if (container) {
+                    const inner = container.querySelector('.newpage');
+                    if (inner) {
+                        inner.remove();
+                    }
+                }
+            }
+        }
+        """,
+        list(page_numbers),
+    )
+
+    try:
+        driver.execute_cdp_cmd("HeapProfiler.collectGarbage", {})
+    except WebDriverException:
+        pass
+
+
 def save_pdf_pages_individually(
     driver,
     filename,
     timeout_seconds=DEFAULT_CDP_TIMEOUT_SECONDS,
 ):
-    import fitz
+    from pypdf import PdfReader, PdfWriter
 
     configure_command_timeout(
         driver,
@@ -609,13 +931,34 @@ def save_pdf_pages_individually(
 
     print(
         f"Exporting {page_count} "
-        "document pages individually..."
+        "document pages in bounded batches "
+        f"of {DEFAULT_EXPORT_BATCH_SIZE}..."
     )
 
-    final_pdf = fitz.open()
+    spool = tempfile.TemporaryDirectory(
+        prefix="scribd-pdf-pages-"
+    )
+    page_files = []
 
     try:
         for index in range(page_count):
+            if index % DEFAULT_EXPORT_BATCH_SIZE == 0:
+                batch_end = min(
+                    page_count,
+                    index + DEFAULT_EXPORT_BATCH_SIZE,
+                )
+                batch_page_numbers = list(
+                    range(index + 1, batch_end + 1)
+                )
+                print(
+                    f"  Loading page batch "
+                    f"{index + 1}-{batch_end}/{page_count}..."
+                )
+                load_page_batch(
+                    driver,
+                    batch_page_numbers,
+                )
+
             page_info = driver.execute_script(
                 """
                 const targetIndex = arguments[0];
@@ -840,47 +1183,58 @@ def save_pdf_pages_individually(
                 result["data"]
             )
 
-            page_pdf = fitz.open(
-                stream=pdf_bytes,
-                filetype="pdf",
-            )
-
-            try:
-                if page_pdf.page_count != 1:
-                    raise RuntimeError(
-                        f"Document page "
-                        f"{index + 1} produced "
-                        f"{page_pdf.page_count} "
-                        "PDF sheets; expected exactly 1."
-                    )
-
-                final_pdf.insert_pdf(
-                    page_pdf,
-                    from_page=0,
-                    to_page=0,
+            page_reader = PdfReader(BytesIO(pdf_bytes))
+            if len(page_reader.pages) != 1:
+                raise RuntimeError(
+                    f"Document page "
+                    f"{index + 1} produced "
+                    f"{len(page_reader.pages)} "
+                    "PDF sheets; expected exactly 1."
                 )
 
-            finally:
-                page_pdf.close()
+            page_path = os.path.join(
+                spool.name,
+                f"page-{index + 1:08d}.pdf",
+            )
+            with open(page_path, "wb") as page_handle:
+                page_handle.write(pdf_bytes)
+            page_files.append(page_path)
 
             print(
                 f"    OK: exactly 1 PDF sheet"
             )
 
-        if final_pdf.page_count == 0:
+            is_batch_end = (
+                (index + 1) % DEFAULT_EXPORT_BATCH_SIZE == 0
+                or index + 1 == page_count
+            )
+            if is_batch_end:
+                release_page_batch(
+                    driver,
+                    batch_page_numbers,
+                )
+
+        if not page_files:
             raise RuntimeError(
                 "No valid document pages "
                 "were exported."
             )
 
-        final_pdf.save(
-            filename,
-            garbage=4,
-            deflate=True,
+        print(
+            f"Merging {len(page_files)} "
+            "disk-spooled PDF pages..."
         )
+        writer = PdfWriter()
+        try:
+            for page_path in page_files:
+                writer.append(page_path)
+            with open(filename, "wb") as output_handle:
+                writer.write(output_handle)
+        finally:
+            writer.close()
 
     finally:
-        final_pdf.close()
+        spool.cleanup()
 
     return os.path.abspath(filename)
 
@@ -930,9 +1284,10 @@ def main():
             hide_cookie_dialogs(driver)
             print("Cookie dialogs hidden.")
 
-            total_pages = scroll_through_pages(
-                driver,
-                DEFAULT_SCROLL_DELAY_SECONDS,
+            total_pages = driver.execute_script(
+                """
+                return document.querySelectorAll('.outer_page').length;
+                """
             )
 
             if total_pages == 0:
@@ -944,11 +1299,6 @@ def main():
             prepare_document_for_print(driver)
 
             inject_print_styles(driver)
-
-            wait_for_render_stability(
-                driver,
-                DEFAULT_RENDER_SETTLE_TIMEOUT_SECONDS,
-            )
 
             print(
                 f"\nSaving PDF as: {pdf_filename}"
